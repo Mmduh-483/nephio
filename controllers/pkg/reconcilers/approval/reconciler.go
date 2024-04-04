@@ -20,6 +20,7 @@ import (
 	"context"
 	"fmt"
 	"reflect"
+	"strings"
 	"time"
 
 	"k8s.io/client-go/rest"
@@ -33,8 +34,6 @@ import (
 
 	porchv1alpha1 "github.com/GoogleContainerTools/kpt/porch/api/porch/v1alpha1"
 	porchclient "github.com/nephio-project/nephio/controllers/pkg/porch/client"
-	porchconds "github.com/nephio-project/nephio/controllers/pkg/porch/condition"
-	porchutil "github.com/nephio-project/nephio/controllers/pkg/porch/util"
 	"github.com/nephio-project/nephio/controllers/pkg/resource"
 	"github.com/pkg/errors"
 	corev1 "k8s.io/api/core/v1"
@@ -57,9 +56,8 @@ func init() {
 // +kubebuilder:rbac:groups=porch.kpt.dev,resources=packagerevisions,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=porch.kpt.dev,resources=packagerevisions/status,verbs=get
 // +kubebuilder:rbac:groups=porch.kpt.dev,resources=packagerevisions/approval,verbs=get;update;patch
-// +kubebuilder:rbac:groups=config.porch.kpt.dev,resources=packagevariants,verbs=get;list;watch
-// +kubebuilder:rbac:groups=config.porch.kpt.dev,resources=packagevariants/status,verbs=get
-// +kubebuilder:rbac:groups="",resources=events,verbs=create;patch
+// +kubebuilder:rbac:groups="",resources=events,verbs=get;list;watch;create;patch
+
 // SetupWithManager sets up the controller with the Manager.
 func (r *reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, c interface{}) (map[schema.GroupVersionKind]chan event.GenericEvent, error) {
 	cfg, ok := c.(*ctrlconfig.ControllerConfig)
@@ -67,21 +65,19 @@ func (r *reconciler) SetupWithManager(ctx context.Context, mgr ctrl.Manager, c i
 		return nil, fmt.Errorf("cannot initialize, expecting controllerConfig, got: %s", reflect.TypeOf(c).Name())
 	}
 
-	r.Client = mgr.GetClient()
-	r.porchClient = cfg.PorchClient
+	r.baseClient = mgr.GetClient()
 	r.porchRESTClient = cfg.PorchRESTClient
 	r.recorder = mgr.GetEventRecorderFor("approval-controller")
 
 	return nil, ctrl.NewControllerManagedBy(mgr).
 		Named("ApprovalController").
-		For(&porchv1alpha1.PackageRevision{}).
+		For(&corev1.Event{}).
 		Complete(r)
 }
 
 // reconciler reconciles a NetworkInstance object
 type reconciler struct {
-	client.Client
-	porchClient     client.Client
+	baseClient      client.Client
 	porchRESTClient rest.Interface
 	recorder        record.EventRecorder
 }
@@ -90,8 +86,30 @@ func (r *reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 	log := log.FromContext(ctx).WithValues("req", req)
 	log.Info("reconcile approval")
 
+	ev := &corev1.Event{}
+	if err := r.baseClient.Get(ctx, req.NamespacedName, ev); err != nil {
+		// There's no need to requeue if we no longer exist. Otherwise we'll be
+		// requeued implicitly because we return an error.
+		if resource.IgnoreNotFound(err) != nil {
+			log.Error(err, "cannot get resource")
+			return ctrl.Result{}, errors.Wrap(resource.IgnoreNotFound(err), "cannot get resource")
+		}
+
+		return ctrl.Result{}, nil
+	}
+
+	evObjGVK := ev.InvolvedObject.GroupVersionKind()
+	if evObjGVK.Group != porchv1alpha1.GroupName ||
+		evObjGVK.Version != porchv1alpha1.SchemeGroupVersion.Version ||
+		evObjGVK.Kind != "PackageRevision" ||
+		(ev.Reason != "PackageRevisionReady" && ev.Reason != "Proposed") {
+		return ctrl.Result{}, nil
+	}
+
+	prObjKey := client.ObjectKey{Namespace: ev.InvolvedObject.Namespace, Name: ev.InvolvedObject.Name}
 	pr := &porchv1alpha1.PackageRevision{}
-	if err := r.Get(ctx, req.NamespacedName, pr); err != nil {
+	err := r.baseClient.Get(ctx, prObjKey, pr)
+	if err != nil {
 		// There's no need to requeue if we no longer exist. Otherwise we'll be
 		// requeued implicitly because we return an error.
 		if resource.IgnoreNotFound(err) != nil {
@@ -107,35 +125,6 @@ func (r *reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{}, nil
 	}
 
-	// If the package revision is owned by a PackageVariant, check the Ready condition
-	// of the package variant. If it is not Ready, then we should not approve yet. The
-	// lack of readiness could indicate an error which even impacts whether or not the
-	// readiness gates have been properly set.
-	pvReady, err := porchutil.PackageVariantReady(ctx, pr, r.porchClient)
-	if err != nil {
-		r.recorder.Event(pr, corev1.EventTypeWarning,
-			"Error", fmt.Sprintf("could not get owning PackageVariant: %s", err.Error()))
-
-		return ctrl.Result{}, nil
-	}
-
-	if !pvReady {
-		r.recorder.Event(pr, corev1.EventTypeNormal,
-			"NotApproved", "owning PackageVariant not Ready")
-
-		return ctrl.Result{RequeueAfter: RequeueDuration}, nil
-	}
-
-	// All policies require readiness gates to be met, so if they
-	// are not, we are done for now.
-	if !porchconds.PackageRevisionIsReady(pr.Spec.ReadinessGates, pr.Status.Conditions) {
-		r.recorder.Event(pr, corev1.EventTypeNormal,
-			"NotApproved", "readiness gates not met")
-
-		return ctrl.Result{RequeueAfter: RequeueDuration}, nil
-	}
-
-	// Readiness is met, so check our other policies
 	approve := false
 	switch policy {
 	case InitialPolicyAnnotationValue:
@@ -186,31 +175,60 @@ func (r *reconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctrl.Resu
 		return ctrl.Result{RequeueAfter: requeue}, nil
 	}
 
+	// pull latest PR to avoid err of PR has been modified
+	// Use retry mechanism to overcome The error being intermittent
+	for i := 0; i < 5; i++ {
+		pr = &porchv1alpha1.PackageRevision{}
+		err = r.baseClient.Get(ctx, prObjKey, pr)
+		if err != nil {
+			// There's no need to requeue if we no longer exist. Otherwise we'll be
+			// requeued implicitly because we return an error.
+			if resource.IgnoreNotFound(err) != nil {
+				log.Error(err, "cannot get resource")
+				return ctrl.Result{}, errors.Wrap(resource.IgnoreNotFound(err), "cannot get resource")
+			}
+			time.Sleep(time.Second)
+			continue
+		}
+
+		// All policies met
+		if pr.Spec.Lifecycle == porchv1alpha1.PackageRevisionLifecycleDraft {
+			pr.Spec.Lifecycle = porchv1alpha1.PackageRevisionLifecycleProposed
+			err = r.baseClient.Update(ctx, pr)
+		} else {
+			err = porchclient.UpdatePackageRevisionApproval(ctx, r.porchRESTClient, client.ObjectKey{
+				Namespace: pr.Namespace,
+				Name:      pr.Name,
+			}, porchv1alpha1.PackageRevisionLifecyclePublished)
+		}
+
+		if err != nil {
+			if strings.Contains(err.Error(), "the object has been modified") {
+				log.Info("retry to update PackageRevision due to \"the object has been modified\" error", "resourceVersion", pr.GetResourceVersion())
+				time.Sleep(time.Second)
+				continue
+			}
+			break
+		}
+	}
+
 	action := "approving"
 	reason := "Approved"
 
-	// All policies met
 	if pr.Spec.Lifecycle == porchv1alpha1.PackageRevisionLifecycleDraft {
 		action = "proposing"
 		reason = "Proposed"
-		pr.Spec.Lifecycle = porchv1alpha1.PackageRevisionLifecycleProposed
-		err = r.Update(ctx, pr)
-	} else {
-		err = porchclient.UpdatePackageRevisionApproval(ctx, r.porchRESTClient, client.ObjectKey{
-			Namespace: pr.Namespace,
-			Name:      pr.Name,
-		}, porchv1alpha1.PackageRevisionLifecyclePublished)
 	}
 
 	if err != nil {
 		r.recorder.Eventf(pr, corev1.EventTypeWarning,
 			"Error", "error %s: %s", action, err.Error())
-	} else {
-		r.recorder.Eventf(pr, corev1.EventTypeNormal,
-			reason, "all approval policies met")
+		return ctrl.Result{}, err
 	}
 
-	return ctrl.Result{}, err
+	r.recorder.Eventf(pr, corev1.EventTypeNormal, reason, "all approval policies met")
+
+	return ctrl.Result{}, nil
 }
 
 func shouldProcess(pr *porchv1alpha1.PackageRevision) (string, bool) {
@@ -251,7 +269,7 @@ func manageDelay(pr *porchv1alpha1.PackageRevision) (time.Duration, error) {
 
 func (r *reconciler) policyInitial(ctx context.Context, pr *porchv1alpha1.PackageRevision) (bool, error) {
 	var prList porchv1alpha1.PackageRevisionList
-	if err := r.Client.List(ctx, &prList); err != nil {
+	if err := r.baseClient.List(ctx, &prList); err != nil {
 		return false, err
 	}
 
@@ -269,3 +287,4 @@ func (r *reconciler) policyInitial(ctx context.Context, pr *porchv1alpha1.Packag
 	// we did not find an already published revision of this package, so approve it
 	return true, nil
 }
+
